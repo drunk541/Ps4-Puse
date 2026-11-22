@@ -2,7 +2,6 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include <errno.h>
 #include <unistd.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -51,8 +50,7 @@ static int send_all(int fd, const char *data, size_t length) {
     while (sent < length) {
         ssize_t n = write(fd, data + sent, length - sent);
         if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
+                        return -1;
         }
         if (n == 0) return -1;
         sent += (size_t)n;
@@ -65,7 +63,7 @@ static void *server_worker(void *arg) {
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        final_printf("[PS4-Puse] socket failed: %s\n", strerror(errno));
+        final_printf("[PS4-Puse] socket failed: %s\n", "system call failed");
         return NULL;
     }
 
@@ -79,13 +77,13 @@ static void *server_worker(void *arg) {
     addr.sin_port = htons(SERVER_PORT);
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        final_printf("[PS4-Puse] bind failed: %s\n", strerror(errno));
+        final_printf("[PS4-Puse] bind failed: %s\n", "system call failed");
         close(fd);
         return NULL;
     }
 
     if (listen(fd, 5) != 0) {
-        final_printf("[PS4-Puse] listen failed: %s\n", strerror(errno));
+        final_printf("[PS4-Puse] listen failed: %s\n", "system call failed");
         close(fd);
         return NULL;
     }
@@ -100,8 +98,7 @@ static void *server_worker(void *arg) {
         int clientFd = accept(fd, (struct sockaddr *)&client, &clientLen);
         if (clientFd < 0) {
             if (!g_running) break;
-            if (errno == EINTR) continue;
-            continue;
+                        continue;
         }
 
         char request[1024];
