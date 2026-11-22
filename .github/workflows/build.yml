@@ -11,11 +11,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build environment
-        uses: OpenOrbis/toolchain-action@main
-        with:
-          version: v0.5.1
-          command: |
-            echo "PS4-Puse build environment ready"
-            clang --version
-            echo "$OO_PS4_TOOLCHAIN"
+      - name: Setup OpenOrbis
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            openorbisofficial/toolchain:v0.5.1 \
+            bash -lc '
+              echo "PS4-Puse environment ready"
+              clang --version
+              echo "OO_PS4_TOOLCHAIN=$OO_PS4_TOOLCHAIN"
+            '
