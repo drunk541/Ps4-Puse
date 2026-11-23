@@ -380,6 +380,11 @@ static void *play_worker(void *arg) {
                     playStatus = -6;
                     goto cleanup;
                 }
+                if (audioOutput(handle, NULL) < 0) {
+                    playError = -7;
+                    playStatus = -7;
+                    goto cleanup;
+                }
             }
 
             if (info.channels != channels || info.hz != rate) {
@@ -396,14 +401,7 @@ static void *play_worker(void *arg) {
                 memcpy(out, pcm + pos * channels,
                     (size_t)count * channels * sizeof(mp3d_sample_t));
 
-                int r = audioOutput(handle, NULL);
-                if (r < 0) {
-                    playError = r;
-                    playStatus = -7;
-                    goto cleanup;
-                }
-
-                r = audioOutput(handle, out);
+                int r = audioOutput(handle, out);
                 if (r < 0) {
                     playError = r;
                     playStatus = -7;
