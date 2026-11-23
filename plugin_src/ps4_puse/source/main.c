@@ -356,7 +356,7 @@ static void *play_worker(void *arg) {
 
                 playStatus = 4;
                 r = userInit(NULL);
-                if (r < 0) {
+                if (r < 0 && (uint32_t)r != 0x80960003u) {
                     playError = r;
                     playStatus = -4;
                     goto cleanup;
