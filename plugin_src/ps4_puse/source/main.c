@@ -38,6 +38,8 @@ static AudioCloseFn audioClose;
 static UserInitFn userInit;
 
 static int audioReady;
+static volatile int playStatus;
+static volatile int playError;
 static OrbisPthread serverThread;
 static OrbisPthread playThread;
 static volatile int running;
@@ -92,6 +94,10 @@ static const char page[] =
 "async function stopMusic(){try{let r=await fetch('/api/stop');let j=await r.json();"
 "document.getElementById('status').textContent=j.message||j.error||'Stopped';}"
 "catch(e){document.getElementById('status').textContent='Stop failed';}}"
+"async function refreshStatus(){try{let r=await fetch('/api/status');"
+"let j=await r.json();if(j.status!==0){let e=document.getElementById('status');"
+"e.textContent=j.message+(j.error?' (code '+j.error+')':'');}}catch(e){}}"
+"setInterval(refreshStatus,1000);"
 "load('internal',document.querySelector('.card button'));"
 "</script></body></html>";
 
@@ -284,13 +290,20 @@ static int load_audio_functions(void) {
 
 
 
+
 static void *play_worker(void *arg) {
     char path[512];
     snprintf(path, sizeof(path), "%s", (const char *)arg);
     free(arg);
 
+    playStatus = 1;
+    playError = 0;
+
     FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
+    if (!fp) {
+        playStatus = -1;
+        return NULL;
+    }
 
     mp3dec_t dec;
     mp3dec_init(&dec);
@@ -298,10 +311,9 @@ static void *play_worker(void *arg) {
     unsigned char input[16384];
     mp3d_sample_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
     size_t bytes = 0;
-    int eof = 0;
+    int eof = 0, decodedFrames = 0;
     int32_t handle = -1;
-    int channels = 0;
-    int rate = 0;
+    int channels = 0, rate = 0;
 
     while (!playStop) {
         if (!eof && bytes < sizeof(input)) {
@@ -312,48 +324,68 @@ static void *play_worker(void *arg) {
         }
 
         size_t offset = 0;
-
         while (!playStop && offset < bytes) {
-            mp3dec_frame_info_t info;
+            mp3dec_frame_info_t info = {0};
             int samples = mp3dec_decode_frame(
                 &dec, input + offset, (int)(bytes - offset),
                 pcm, &info
             );
 
-            if (info.frame_bytes <= 0)
-                break;
-
+            if (info.frame_bytes <= 0) break;
             offset += (size_t)info.frame_bytes;
+            if (samples <= 0) continue;
 
-            if (samples <= 0)
-                continue;
-
+            decodedFrames++;
             if (handle < 0) {
                 channels = info.channels;
                 rate = info.hz;
 
                 if ((channels != 1 && channels != 2) ||
-                    (rate != 32000 && rate != 44100 && rate != 48000))
+                    (rate != 32000 && rate != 44100 && rate != 48000)) {
+                    playStatus = -2;
                     goto cleanup;
+                }
 
-                if (load_audio_functions() != 0)
+                playStatus = 3;
+                int r = load_audio_functions();
+                if (r != 0) {
+                    playError = r;
+                    playStatus = -3;
                     goto cleanup;
+                }
 
-                userInit(NULL);
-                if (audioInit() < 0)
+                playStatus = 4;
+                r = userInit(NULL);
+                if (r < 0) {
+                    playError = r;
+                    playStatus = -4;
                     goto cleanup;
+                }
 
+                r = audioInit();
+                if (r < 0) {
+                    playError = r;
+                    playStatus = -5;
+                    goto cleanup;
+                }
+
+                playStatus = 5;
                 handle = audioOpen(
                     0xFF, 0, 0, 256, (uint32_t)rate,
                     channels == 1 ? 0 : 1
                 );
 
-                if (handle <= 0)
+                if (handle <= 0) {
+                    playError = handle;
+                    playStatus = -6;
                     goto cleanup;
+                }
             }
 
-            if (info.channels != channels || info.hz != rate)
+            if (info.channels != channels || info.hz != rate) {
+                playStatus = -2;
                 goto cleanup;
+            }
 
             int pos = 0;
             while (pos < samples && !playStop) {
@@ -362,12 +394,23 @@ static void *play_worker(void *arg) {
 
                 mp3d_sample_t out[512] = {0};
                 memcpy(out, pcm + pos * channels,
-                       (size_t)count * channels * sizeof(mp3d_sample_t));
+                    (size_t)count * channels * sizeof(mp3d_sample_t));
 
-                if (audioOutput(handle, NULL) < 0 ||
-                    audioOutput(handle, out) < 0)
+                int r = audioOutput(handle, NULL);
+                if (r < 0) {
+                    playError = r;
+                    playStatus = -7;
                     goto cleanup;
+                }
 
+                r = audioOutput(handle, out);
+                if (r < 0) {
+                    playError = r;
+                    playStatus = -7;
+                    goto cleanup;
+                }
+
+                playStatus = 6;
                 pos += count;
             }
         }
@@ -377,24 +420,24 @@ static void *play_worker(void *arg) {
             bytes -= offset;
         }
 
-        if (eof && bytes == 0)
-            break;
+        if (eof && bytes == 0) break;
 
-        if (bytes == sizeof(input) && offset == 0) {
+        if (bytes == sizeof(input) && offset == 0)
             memmove(input, input + 1, --bytes);
-        }
 
-        if (eof && offset == 0)
-            break;
+        if (eof && offset == 0) break;
     }
 
-cleanup:
-    if (handle > 0)
-        audioClose(handle);
+    if (playStop) playStatus = 8;
+    else if (decodedFrames > 0) playStatus = 7;
+    else playStatus = -8;
 
+cleanup:
+    if (handle > 0) audioClose(handle);
     fclose(fp);
     return NULL;
 }
+
 
 static void stop_playback(void) {
     if (playThreadStarted) {
@@ -432,6 +475,8 @@ static void start_playback(int fd, const char *source, const char *name) {
     strcpy(copy, path);
 
     playStop = 0;
+    playStatus = 1;
+    playError = 0;
     int r = scePthreadCreate(&playThread, NULL, play_worker,
                              copy, "PS4PuseAudio");
     if (r != 0) {
@@ -464,6 +509,30 @@ static void decode_url(char *s) {
         src++;
     }
     *dst = 0;
+}
+
+
+static const char *play_status_message(int status) {
+    switch (status) {
+        case 0: return "Idle";
+        case 1: return "Starting player";
+        case 3: return "Loading audio modules";
+        case 4: return "Initializing audio service";
+        case 5: return "Opening audio port";
+        case 6: return "Playing";
+        case 7: return "Playback finished";
+        case 8: return "Stopped";
+        case -1: return "File open failed";
+        case -2: return "Unsupported MP3 format";
+        case -3: return "Audio module loading failed";
+        case -4: return "UserService initialization failed";
+        case -5: return "AudioOut initialization failed";
+        case -6: return "Audio port opening failed";
+        case -7: return "Audio output failed";
+        case -8: return "No decodable MP3 frames";
+        case -9: return "Player thread creation failed";
+        default: return "Unknown playback state";
+    }
 }
 
 static void *server_worker(void *arg) {
@@ -507,7 +576,15 @@ static void *server_worker(void *arg) {
         if (n > 0) {
             req[n] = 0;
 
-            if (strstr(req, "GET /api/files")) {
+            if (strstr(req, "GET /api/status")) {
+                char json[256];
+                snprintf(json, sizeof(json),
+                    "{\"status\":%d,\"error\":%d,\"message\":\"%s\"}",
+                    (int)playStatus, (int)playError,
+                    play_status_message(playStatus));
+                respond(c, "application/json", json);
+
+            } else if (strstr(req, "GET /api/files")) {
                 char source[32] = "internal";
                 char *q = strstr(req, "source=");
                 if (q) {
