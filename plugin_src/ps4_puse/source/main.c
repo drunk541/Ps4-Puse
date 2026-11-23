@@ -291,6 +291,7 @@ static int load_audio_functions(void) {
 
 
 
+
 static void *play_worker(void *arg) {
     char path[512];
     snprintf(path, sizeof(path), "%s", (const char *)arg);
@@ -310,43 +311,63 @@ static void *play_worker(void *arg) {
 
     unsigned char input[16384];
     mp3d_sample_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+    mp3d_sample_t out[512];
+
     size_t bytes = 0;
-    int eof = 0, decodedFrames = 0;
+    int eof = 0;
+    int decodedFrames = 0;
+    int outFrames = 0;
+
     int32_t handle = -1;
-    int channels = 0, rate = 0;
+    int channels = 0;
+    int rate = 0;
 
     while (!playStop) {
         if (!eof && bytes < sizeof(input)) {
-            size_t n = fread(input + bytes, 1,
-                             sizeof(input) - bytes, fp);
+            size_t n = fread(
+                input + bytes, 1,
+                sizeof(input) - bytes, fp
+            );
             bytes += n;
             if (n == 0) eof = 1;
         }
 
         size_t offset = 0;
+
         while (!playStop && offset < bytes) {
             mp3dec_frame_info_t info = {0};
+
             int samples = mp3dec_decode_frame(
-                &dec, input + offset, (int)(bytes - offset),
-                pcm, &info
+                &dec,
+                input + offset,
+                (int)(bytes - offset),
+                pcm,
+                &info
             );
 
-            if (info.frame_bytes <= 0) break;
+            if (info.frame_bytes <= 0)
+                break;
+
             offset += (size_t)info.frame_bytes;
-            if (samples <= 0) continue;
+
+            if (samples <= 0)
+                continue;
 
             decodedFrames++;
+
             if (handle < 0) {
                 channels = info.channels;
                 rate = info.hz;
 
                 if ((channels != 1 && channels != 2) ||
-                    (rate != 32000 && rate != 44100 && rate != 48000)) {
+                    (rate != 32000 && rate != 44100 &&
+                     rate != 48000)) {
                     playStatus = -2;
                     goto cleanup;
                 }
 
                 playStatus = 3;
+
                 int r = load_audio_functions();
                 if (r != 0) {
                     playError = r;
@@ -355,23 +376,28 @@ static void *play_worker(void *arg) {
                 }
 
                 playStatus = 4;
+
                 r = userInit(NULL);
-                if (r < 0 && (uint32_t)r != 0x80960003u) {
+                if (r < 0 &&
+                    (uint32_t)r != 0x80960003u) {
                     playError = r;
                     playStatus = -4;
                     goto cleanup;
                 }
 
                 r = audioInit();
-                if (r < 0 && (uint32_t)r != 0x8026000Eu) {
+                if (r < 0 &&
+                    (uint32_t)r != 0x8026000Eu) {
                     playError = r;
                     playStatus = -5;
                     goto cleanup;
                 }
 
                 playStatus = 5;
+
                 handle = audioOpen(
-                    0xFF, 0, 0, 256, (uint32_t)rate,
+                    0xFF, 0, 0, 256,
+                    (uint32_t)rate,
                     channels == 1 ? 0 : 1
                 );
 
@@ -380,36 +406,53 @@ static void *play_worker(void *arg) {
                     playStatus = -6;
                     goto cleanup;
                 }
-                if (audioOutput(handle, NULL) < 0) {
-                    playError = -7;
-                    playStatus = -7;
-                    goto cleanup;
-                }
             }
 
-            if (info.channels != channels || info.hz != rate) {
+            if (info.channels != channels ||
+                info.hz != rate) {
                 playStatus = -2;
                 goto cleanup;
             }
 
             int pos = 0;
+
             while (pos < samples && !playStop) {
-                int count = samples - pos;
-                if (count > 256) count = 256;
+                int copyFrames = 256 - outFrames;
 
-                mp3d_sample_t out[512] = {0};
-                memcpy(out, pcm + pos * channels,
-                    (size_t)count * channels * sizeof(mp3d_sample_t));
+                if (copyFrames > samples - pos)
+                    copyFrames = samples - pos;
 
-                int r = audioOutput(handle, out);
-                if (r < 0) {
-                    playError = r;
-                    playStatus = -7;
-                    goto cleanup;
+                memcpy(
+                    out + outFrames * channels,
+                    pcm + pos * channels,
+                    (size_t)copyFrames * channels *
+                    sizeof(mp3d_sample_t)
+                );
+
+                outFrames += copyFrames;
+                pos += copyFrames;
+
+                if (outFrames == 256) {
+                    /* Wait until previous audio buffer completes */
+                    int r = audioOutput(handle, NULL);
+
+                    if (r < 0) {
+                        playError = r;
+                        playStatus = -7;
+                        goto cleanup;
+                    }
+
+                    r = audioOutput(handle, out);
+
+                    if (r < 0) {
+                        playError = r;
+                        playStatus = -7;
+                        goto cleanup;
+                    }
+
+                    outFrames = 0;
+                    playStatus = 6;
                 }
-
-                playStatus = 6;
-                pos += count;
             }
         }
 
@@ -418,24 +461,50 @@ static void *play_worker(void *arg) {
             bytes -= offset;
         }
 
-        if (eof && bytes == 0) break;
+        if (eof && bytes == 0)
+            break;
 
         if (bytes == sizeof(input) && offset == 0)
             memmove(input, input + 1, --bytes);
 
-        if (eof && offset == 0) break;
+        if (eof && offset == 0)
+            break;
     }
 
-    if (playStop) playStatus = 8;
-    else if (decodedFrames > 0) playStatus = 7;
-    else playStatus = -8;
+    /* Send the final partial buffer, padded with silence */
+    if (!playStop && handle > 0 && outFrames > 0) {
+        memset(
+            out + outFrames * channels,
+            0,
+            (size_t)(256 - outFrames) * channels *
+            sizeof(mp3d_sample_t)
+        );
+
+        int r = audioOutput(handle, NULL);
+        if (r >= 0)
+            r = audioOutput(handle, out);
+
+        if (r < 0) {
+            playError = r;
+            playStatus = -7;
+            goto cleanup;
+        }
+    }
+
+    if (playStop)
+        playStatus = 8;
+    else if (decodedFrames > 0)
+        playStatus = 7;
+    else
+        playStatus = -8;
 
 cleanup:
-    if (handle > 0) audioClose(handle);
+    if (handle > 0)
+        audioClose(handle);
+
     fclose(fp);
     return NULL;
 }
-
 
 static void stop_playback(void) {
     if (playThreadStarted) {
