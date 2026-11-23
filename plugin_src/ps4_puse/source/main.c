@@ -12,7 +12,7 @@
 #include <arpa/inet.h>
 #include <orbis/libkernel.h>
 #define MINIMP3_IMPLEMENTATION
-#include "minimp3/minimp3_ex.h"
+#include "minimp3/minimp3.h"
 #include "plugin_common.h"
 
 attr_public const char *g_pluginName = "PS4-Puse";
@@ -207,14 +207,6 @@ static void list_files(int fd, const char *source) {
     respond(fd, "application/json", body);
 }
 
-static uint16_t le16(const unsigned char *p) {
-    return (uint16_t)(p[0] | (p[1] << 8));
-}
-
-static uint32_t le32(const unsigned char *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
 
 static int load_audio_functions(void) {
     if (audioReady) return 0;
@@ -239,67 +231,116 @@ static int load_audio_functions(void) {
 }
 
 
+
 static void *play_worker(void *arg) {
     char path[512];
     snprintf(path, sizeof(path), "%s", (const char *)arg);
     free(arg);
 
-    mp3dec_ex_t dec;
-    memset(&dec, 0, sizeof(dec));
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
 
-    if (mp3dec_ex_open(&dec, path, MP3D_SEEK_TO_BYTE) != 0)
-        return NULL;
+    mp3dec_t dec;
+    mp3dec_init(&dec);
 
-    int channels = dec.info.channels;
-    int rate = dec.info.hz;
-
-    if ((channels != 1 && channels != 2) ||
-        (rate != 44100 && rate != 48000)) {
-        mp3dec_ex_close(&dec);
-        return NULL;
-    }
-
-    if (load_audio_functions() != 0) {
-        mp3dec_ex_close(&dec);
-        return NULL;
-    }
-
-    userInit(NULL);
-    if (audioInit() < 0) {
-        mp3dec_ex_close(&dec);
-        return NULL;
-    }
-
-    int32_t handle = audioOpen(
-        0xFF, 0, 0, 256, (uint32_t)rate,
-        channels == 1 ? 0 : 1
-    );
-
-    if (handle <= 0) {
-        mp3dec_ex_close(&dec);
-        return NULL;
-    }
-
-    mp3d_sample_t buffer[256 * 2];
-    const size_t wanted = 256 * (size_t)channels;
+    unsigned char input[16384];
+    mp3d_sample_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+    size_t bytes = 0;
+    int eof = 0;
+    int32_t handle = -1;
+    int channels = 0;
+    int rate = 0;
 
     while (!playStop) {
-        size_t got = mp3dec_ex_read(&dec, buffer, wanted);
-        if (got == 0)
+        if (!eof && bytes < sizeof(input)) {
+            size_t n = fread(input + bytes, 1,
+                             sizeof(input) - bytes, fp);
+            bytes += n;
+            if (n == 0) eof = 1;
+        }
+
+        size_t offset = 0;
+
+        while (!playStop && offset < bytes) {
+            mp3dec_frame_info_t info;
+            int samples = mp3dec_decode_frame(
+                &dec, input + offset, (int)(bytes - offset),
+                pcm, &info
+            );
+
+            if (info.frame_bytes <= 0)
+                break;
+
+            offset += (size_t)info.frame_bytes;
+
+            if (samples <= 0)
+                continue;
+
+            if (handle < 0) {
+                channels = info.channels;
+                rate = info.hz;
+
+                if ((channels != 1 && channels != 2) ||
+                    (rate != 32000 && rate != 44100 && rate != 48000))
+                    goto cleanup;
+
+                if (load_audio_functions() != 0)
+                    goto cleanup;
+
+                userInit(NULL);
+                if (audioInit() < 0)
+                    goto cleanup;
+
+                handle = audioOpen(
+                    0xFF, 0, 0, 256, (uint32_t)rate,
+                    channels == 1 ? 0 : 1
+                );
+
+                if (handle <= 0)
+                    goto cleanup;
+            }
+
+            if (info.channels != channels || info.hz != rate)
+                goto cleanup;
+
+            int pos = 0;
+            while (pos < samples && !playStop) {
+                int count = samples - pos;
+                if (count > 256) count = 256;
+
+                mp3d_sample_t out[512] = {0};
+                memcpy(out, pcm + pos * channels,
+                       (size_t)count * channels * sizeof(mp3d_sample_t));
+
+                if (audioOutput(handle, NULL) < 0 ||
+                    audioOutput(handle, out) < 0)
+                    goto cleanup;
+
+                pos += count;
+            }
+        }
+
+        if (offset > 0) {
+            memmove(input, input + offset, bytes - offset);
+            bytes -= offset;
+        }
+
+        if (eof && bytes == 0)
             break;
 
-        if (got < wanted)
-            memset(buffer + got, 0,
-                   (wanted - got) * sizeof(mp3d_sample_t));
+        if (bytes == sizeof(input) && offset == 0) {
+            memmove(input, input + 1, --bytes);
+        }
 
-        if (audioOutput(handle, NULL) < 0)
-            break;
-        if (audioOutput(handle, buffer) < 0)
+        if (eof && offset == 0)
             break;
     }
 
-    audioClose(handle);
-    mp3dec_ex_close(&dec);
+cleanup:
+    if (handle > 0)
+        audioClose(handle);
+
+    fclose(fp);
     return NULL;
 }
 
