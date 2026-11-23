@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <orbis/libkernel.h>
+#include <orbis/Sysmodule.h>
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3/minimp3.h"
 #include "plugin_common.h"
@@ -208,27 +209,78 @@ static void list_files(int fd, const char *source) {
 }
 
 
+
+static int find_module_handle(const char *name, int32_t *handle_out) {
+    OrbisKernelModule handles[256] = {0};
+    size_t count = 0;
+
+    int ret = sceKernelGetModuleList(handles, sizeof(handles), &count);
+    if (ret != 0) return -1;
+
+    if (count > 256) count = 256;
+
+    for (size_t i = 0; i < count; i++) {
+        OrbisKernelModuleInfo info = {0};
+        info.size = sizeof(info);
+
+        if (sceKernelGetModuleInfo(handles[i], &info) != 0)
+            continue;
+
+        if (strstr(info.name, name)) {
+            *handle_out = (int32_t)handles[i];
+            return 0;
+        }
+    }
+
+    return -2;
+}
+
 static int load_audio_functions(void) {
     if (audioReady) return 0;
 
-    int32_t ah = sceKernelLoadStartModule(
-        AUDIO_MODULE, 0, NULL, 0, NULL, NULL);
-    if (ah < 0) return -1;
+    int32_t ret = (int32_t)sceSysmoduleLoadModuleInternal(
+        ORBIS_SYSMODULE_INTERNAL_AUDIOOUT
+    );
+    if (ret < 0) return -1;
 
-    int32_t uh = sceKernelLoadStartModule(
-        USER_MODULE, 0, NULL, 0, NULL, NULL);
-    if (uh < 0) return -2;
+    ret = (int32_t)sceSysmoduleLoadModuleInternal(
+        ORBIS_SYSMODULE_INTERNAL_USER_SERVICE
+    );
+    if (ret < 0) return -2;
 
-    if (sceKernelDlsym(ah, "sceAudioOutInit", (void **)&audioInit) != 0 ||
-        sceKernelDlsym(ah, "sceAudioOutOpen", (void **)&audioOpen) != 0 ||
-        sceKernelDlsym(ah, "sceAudioOutOutput", (void **)&audioOutput) != 0 ||
-        sceKernelDlsym(ah, "sceAudioOutClose", (void **)&audioClose) != 0 ||
-        sceKernelDlsym(uh, "sceUserServiceInitialize", (void **)&userInit) != 0)
+    int32_t audioHandle = 0;
+    int32_t userHandle = 0;
+
+    if (find_module_handle("libSceAudioOut", &audioHandle) != 0)
         return -3;
+
+    if (find_module_handle("libSceUserService", &userHandle) != 0)
+        return -4;
+
+    if (sceKernelDlsym(audioHandle, "sceAudioOutInit",
+                       (void **)&audioInit) != 0)
+        return -5;
+
+    if (sceKernelDlsym(audioHandle, "sceAudioOutOpen",
+                       (void **)&audioOpen) != 0)
+        return -6;
+
+    if (sceKernelDlsym(audioHandle, "sceAudioOutOutput",
+                       (void **)&audioOutput) != 0)
+        return -7;
+
+    if (sceKernelDlsym(audioHandle, "sceAudioOutClose",
+                       (void **)&audioClose) != 0)
+        return -8;
+
+    if (sceKernelDlsym(userHandle, "sceUserServiceInitialize",
+                       (void **)&userInit) != 0)
+        return -9;
 
     audioReady = 1;
     return 0;
 }
+
 
 
 
