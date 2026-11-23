@@ -363,7 +363,7 @@ static void *play_worker(void *arg) {
                 }
 
                 r = audioInit();
-                if (r < 0) {
+                if (r < 0 && (uint32_t)r != 0x8026000Eu) {
                     playError = r;
                     playStatus = -5;
                     goto cleanup;
