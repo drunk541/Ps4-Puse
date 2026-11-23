@@ -47,6 +47,7 @@ static volatile int listenFd = -1;
 static volatile int playStop;
 static int threadStarted;
 static int playThreadStarted;
+static volatile int playDeleteFile;
 
 static const char page[] =
 "<!doctype html><html><head><meta charset='utf-8'>"
@@ -72,6 +73,10 @@ static const char page[] =
 "<button onclick=\"load('usb2',this)\">USB 2</button>"
 "<button onclick=\"load('usb3',this)\">USB 3</button>"
 "<p><button onclick='stopMusic()'>STOP</button></p></div>"
+"<div class='card'><h3>Play from phone</h3>"
+"<input id='phoneFiles' type='file' accept='.mp3,audio/mpeg' multiple>"
+"<p><button id='uploadBtn' onclick='uploadPhoneFiles()'>UPLOAD &amp; PLAY</button></p>"
+"<small>Select one or more MP3 files from your phone</small></div>"
 "<div class='card'><h3>Music library</h3><div id='files' class='muted'>"
 "Choose a source</div></div>"
 "<small>PS4-Puse v3.0 · MP3 playback</small></div><script>"
@@ -97,6 +102,8 @@ static const char page[] =
 "async function refreshStatus(){try{let r=await fetch('/api/status');"
 "let j=await r.json();if(j.status!==0){let e=document.getElementById('status');"
 "e.textContent=j.message+(j.error?' (code '+j.error+')':'');}}catch(e){}}"
+"async function waitPhoneTrack(){return new Promise(resolve=>{let t=setInterval(async()=>{try{let r=await fetch('/api/status');let j=await r.json();if(j.status===7||j.status===8||j.status<0){clearInterval(t);resolve(j);}}catch(e){}},700);});}"
+"async function uploadPhoneFiles(){let input=document.getElementById('phoneFiles');let files=Array.from(input.files||[]);let status=document.getElementById('status');let btn=document.getElementById('uploadBtn');if(!files.length){status.textContent='Choose MP3 files first';return;}btn.disabled=true;try{for(let i=0;i<files.length;i++){let f=files[i];if(!f.name.toLowerCase().endsWith('.mp3'))continue;if(f.size>64*1024*1024)throw new Error(f.name+' is larger than 64 MB');status.textContent='Uploading '+(i+1)+'/'+files.length+': '+f.name;let r=await fetch('/api/upload',{method:'POST',headers:{'Content-Type':'audio/mpeg'},body:f});let j=await r.json();if(!r.ok||j.error)throw new Error(j.error||'Upload failed');status.textContent='Playing: '+f.name;let result=await waitPhoneTrack();if(result.status<0)throw new Error(result.message||'Playback failed');}status.textContent='Phone playlist finished';}catch(e){status.textContent=e.message||'Upload failed';}finally{btn.disabled=false;input.value='';}}"
 "setInterval(refreshStatus,1000);"
 "load('internal',document.querySelector('.card button'));"
 "</script></body></html>";
@@ -302,6 +309,7 @@ static void *play_worker(void *arg) {
 
     FILE *fp = fopen(path, "rb");
     if (!fp) {
+        if (playDeleteFile) unlink(path);
         playStatus = -1;
         return NULL;
     }
@@ -503,6 +511,7 @@ cleanup:
         audioClose(handle);
 
     fclose(fp);
+    if (playDeleteFile) unlink(path);
     return NULL;
 }
 
@@ -525,6 +534,7 @@ static void start_playback(int fd, const char *source, const char *name) {
     }
 
     stop_playback();
+    playDeleteFile = !strcmp(name, ".phone_upload.mp3");
     snprintf(path, sizeof(path), "%s/%s", root, name);
 
     struct stat st;
@@ -548,6 +558,7 @@ static void start_playback(int fd, const char *source, const char *name) {
                              copy, "PS4PuseAudio");
     if (r != 0) {
         free(copy);
+        if (playDeleteFile) unlink(path);
         respond(fd, "application/json",
                 "{\"error\":\"Could not start player thread\"}");
         return;
@@ -555,7 +566,7 @@ static void start_playback(int fd, const char *source, const char *name) {
 
     playThreadStarted = 1;
     respond(fd, "application/json",
-            "{\"message\":\"Playback starting (WAV)\"}");
+            "{\"message\":\"Playback starting (MP3)\"}");
 }
 
 static void decode_url(char *s) {
@@ -602,6 +613,98 @@ static const char *play_status_message(int status) {
     }
 }
 
+
+static void handle_phone_upload(int fd, char *req, size_t req_len) {
+    char *header_end = strstr(req, "\r\n\r\n");
+    if (!header_end) {
+        respond(fd, "application/json", "{\"error\":\"Invalid HTTP headers\"}");
+        return;
+    }
+
+    unsigned long long content_length = 0;
+    int found_length = 0;
+    char *line = strstr(req, "\r\n");
+
+    while (line && line < header_end) {
+        line += 2;
+        if (line >= header_end) break;
+
+        if (!strncasecmp(line, "Content-Length:", 15)) {
+            char *value = line + 15;
+            while (*value == ' ' || *value == '\t') value++;
+            char *end = NULL;
+            content_length = strtoull(value, &end, 10);
+            if (end == value) content_length = 0;
+            else found_length = 1;
+            break;
+        }
+
+        line = strstr(line, "\r\n");
+    }
+
+    if (!found_length || content_length == 0 ||
+        content_length > 64ULL * 1024ULL * 1024ULL) {
+        respond(fd, "application/json",
+                "{\"error\":\"Missing or invalid Content-Length (max 64 MB)\"}");
+        return;
+    }
+
+    char root[128];
+    if (!make_root(root, sizeof(root), "internal")) {
+        respond(fd, "application/json", "{\"error\":\"Storage unavailable\"}");
+        return;
+    }
+
+    stop_playback();
+
+    const char *path = "/data/PS4-Puse/music/.phone_upload.mp3";
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        respond(fd, "application/json", "{\"error\":\"Cannot create temporary file\"}");
+        return;
+    }
+
+    size_t header_bytes = (size_t)((header_end + 4) - req);
+    size_t available = req_len > header_bytes ? req_len - header_bytes : 0;
+    size_t written = 0;
+
+    if (available > content_length) available = (size_t)content_length;
+
+    if (available > 0) {
+        written = fwrite(header_end + 4, 1, available, fp);
+        if (written != available) goto upload_failed;
+    }
+
+    unsigned char buffer[16384];
+
+    while ((unsigned long long)written < content_length) {
+        size_t remaining = (size_t)(content_length - written);
+        size_t wanted = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+
+        ssize_t n = read(fd, buffer, wanted);
+        if (n <= 0) goto upload_failed;
+
+        if (fwrite(buffer, 1, (size_t)n, fp) != (size_t)n)
+            goto upload_failed;
+
+        written += (size_t)n;
+    }
+
+    if (fclose(fp) != 0) {
+        unlink(path);
+        respond(fd, "application/json", "{\"error\":\"File write failed\"}");
+        return;
+    }
+
+    start_playback(fd, "internal", ".phone_upload.mp3");
+    return;
+
+upload_failed:
+    fclose(fp);
+    unlink(path);
+    respond(fd, "application/json", "{\"error\":\"Upload interrupted\"}");
+}
+
 static void *server_worker(void *arg) {
     (void)arg;
 
@@ -639,11 +742,24 @@ static void *server_worker(void *arg) {
         }
 
         char req[2048];
-        ssize_t n = read(c, req, sizeof(req) - 1);
-        if (n > 0) {
-            req[n] = 0;
+        size_t used = 0;
+        ssize_t n = 0;
 
-            if (strstr(req, "GET /api/status")) {
+        while (used < sizeof(req) - 1) {
+            n = read(c, req + used, sizeof(req) - 1 - used);
+            if (n <= 0) break;
+            used += (size_t)n;
+            req[used] = 0;
+            if (strstr(req, "\r\n\r\n")) break;
+        }
+
+        if (used > 0) {
+            n = (ssize_t)used;
+            req[used] = 0;
+
+            if (strstr(req, "POST /api/upload")) {
+                handle_phone_upload(c, req, (size_t)n);
+            } else if (strstr(req, "GET /api/status")) {
                 char json[256];
                 snprintf(json, sizeof(json),
                     "{\"status\":%d,\"error\":%d,\"message\":\"%s\"}",
